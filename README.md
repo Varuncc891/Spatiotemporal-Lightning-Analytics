@@ -5,7 +5,7 @@
 
 ---
 
-<!-- add a picture here — Superset dashboard showing scattered lightning points across India -->
+![Lightning Dashboard](docs/dashboard_1.png)
 
 ---
 
