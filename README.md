@@ -57,7 +57,7 @@ psql -U postgres -d lightning_db -c "
 "
 
 # 6. Ingest real data
-python ingestion/ingest.py --file your_file.csv
+python ingestion/ingest.py --file ingestion/test_data.csv
 ```
 
 **Requirements:** PostgreSQL 17, PostGIS, Python 3.10, psycopg2, Alembic, NumPy
@@ -206,7 +206,7 @@ lightning_strikes  (PARTITIONED BY RANGE timestamp)
 ## Project Structure
 
 ```
-lightning-data-platform/
+nrsc_dashboard_2/
 ├── database/
 │   ├── schema.sql · partitions.sql · indexes.sql · materialized_views.sql
 │   └── migrations/
