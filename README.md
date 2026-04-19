@@ -35,7 +35,7 @@ Designed for weather analytics, research, and government monitoring use cases wh
 
 ```bash
 git clone https://github.com/Varuncc891/Spatiotemporal-Lightning-Analytics
-cd lightning-data-platform
+cd Spatiotemporal-Lightning-Analytics
 
 # 1. Create the database
 psql -U postgres -c "CREATE DATABASE lightning_db;"
@@ -190,7 +190,7 @@ lightning_strikes  (PARTITIONED BY RANGE timestamp)
 ## Project Structure
 
 ```
-nrsc_dashboard_2/
+spatiotemporal_dashboard/
 ├── database/
 │ ├── schema.sql
 │ ├── partitions.sql
