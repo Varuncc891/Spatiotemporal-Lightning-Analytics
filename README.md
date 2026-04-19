@@ -34,7 +34,7 @@ Designed for weather analytics, research, and government monitoring use cases wh
 ## Quick Start
 
 ```bash
-git clone https://github.com/your-username/lightning-data-platform
+git clone https://github.com/Varuncc891/Spatiotemporal-Lightning-Analytics
 cd lightning-data-platform
 
 # 1. Create the database
@@ -167,22 +167,6 @@ python -m alembic upgrade head   # apply
 python -m alembic downgrade -1   # rollback
 python -m alembic history        # audit trail
 ```
-
----
-
-## Sample Output
-
-<!-- add a picture here — SQL Lab query result showing event_id, latitude, longitude, state_name, radiance columns -->
-
-**Top states by strike count (after spatial join):**
-
-| State | Strikes |
-|---|---|
-| Rajasthan | 36,379 |
-| Madhya Pradesh | 32,319 |
-| Maharashtra | 31,068 |
-| Uttar Pradesh | 25,389 |
-| Gujarat | 19,003 |
 
 ---
 
