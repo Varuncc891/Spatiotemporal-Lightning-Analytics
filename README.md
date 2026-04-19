@@ -192,17 +192,33 @@ lightning_strikes  (PARTITIONED BY RANGE timestamp)
 ```
 nrsc_dashboard_2/
 ├── database/
-│   ├── schema.sql · partitions.sql · indexes.sql · materialized_views.sql
-│   └── migrations/
-│       ├── 5566ece10587_create_lightning_strikes_partitioned.py
-│       ├── bdb65b394328_add_indexes.py
-│       └── 48b26036eceb_add_materialized_views.py
+│ ├── schema.sql
+│ ├── partitions.sql
+│ ├── indexes.sql
+│ ├── materialized_views.sql
+│ ├── load_states.sql
+│ └── migrations/
+│ ├── 5566ece10587_create_lightning_strikes_partitioned.py
+│ ├── bdb65b394328_add_indexes.py
+│ └── 48b26036eceb_add_materialized_views.py
 ├── ingestion/
-│   ├── synthetic_generator.py   # 1M row generator with monsoon weighting
-│   └── ingest.py                # ETL pipeline
-└── benchmarks/
-    ├── before_optimization.md
-    └── after_optimization.md
+│ ├── synthetic_generator.py
+│ ├── ingest.py
+│ ├── test_data.csv
+│ ├── test_new_data.csv
+│ └── test_bad_data.csv
+├── benchmarks/
+│ ├── before_optimization.md
+│ └── after_optimization.md
+├── shapefiles/
+│ ├── India_State_Boundary.shp
+│ ├── India_State_Boundary.shx
+│ ├── India_State_Boundary.dbf
+│ └── India_State_Boundary.prj
+├── docs/
+│ └── dashboard_1.png
+├── alembic.ini
+└── README.md
 ```
 
 ---
