@@ -1,7 +1,7 @@
 # Spatiotemporal Lightning Analytics
 
 > Production-grade geospatial lightning analytics on PostgreSQL 17 + PostGIS.  
-> 802ms → 167ms · 1M rows · Time-based partitioning · Spatial joins · Python ETL
+> Time-based partitioning · Composite indexing · Spatial joins · Python ETL
 
 ---
 
@@ -13,7 +13,7 @@
 
 Lightning strike data arrives in high volumes, unevenly distributed across time and geography. A naive flat-table schema collapses under aggregation queries at scale — full sequential scans, no spatial awareness, no pre-computed summaries.
 
-This platform solves that. It stores 1M+ strike events in a partitioned PostGIS schema, spatially joins them to state boundaries, and pre-aggregates them into materialized views so common queries return in milliseconds instead of seconds. The ETL pipeline handles real-world messiness: out-of-bounds coordinates, bad timestamps, duplicate IDs, and partial data.
+This platform solves that. It stores 1M+ strike events in a partitioned PostGIS schema, spatially joins them to state boundaries, serves live point data through a view over the partitioned table, and pre-aggregates daily summaries into a materialized view. The ETL pipeline handles real-world messiness: out-of-bounds coordinates, bad timestamps, duplicate IDs, and partial data.
 
 Designed for weather analytics, research, and government monitoring use cases where query speed and data quality both matter.
 
@@ -21,12 +21,13 @@ Designed for weather analytics, research, and government monitoring use cases wh
 
 ## Highlights
 
-- 🚀 Reduced time-series query time from **802ms → 167ms** via partition pruning (4.8× faster)
-- 🗺️ PostGIS spatial join matching **344k+** strike events to state boundaries
-- 🧱 Range partitioning across 6 years with automatic partition routing
-- ⚙️ Materialized views pre-aggregating 1M rows into **57,916** daily-state summaries
-- 🐍 Python ETL pipeline with validation, deduplication, and 10k-row batch inserts
-- 🔁 Alembic schema migrations with full upgrade/downgrade support
+- 🧱 Range partitioning by year (2021–2025) with automatic partition routing
+- 🗺️ PostGIS exact point-in-polygon (`ST_Within`) spatial join mapping strikes to 36 state boundaries
+- 👁️ Dashboard map reads a live view over the partitioned base table — zero storage, always fresh, no refresh needed
+- ⚙️ Daily materialized view pre-aggregating strikes into **57,916** daily-state summaries
+- 🔒 Database-enforced deduplication via `UNIQUE (event_id, timestamp)` — atomic and race-free
+- 🐍 Python ETL pipeline: validation → batch insert with `ON CONFLICT DO NOTHING` → spatial mapping → MV refresh → verification, in one command
+- 🔁 Alembic as the single source of truth for schema, with upgrade/downgrade paths
 - 📊 Apache Superset dashboard with state + time-range filters on a live map
 
 ---
@@ -40,126 +41,125 @@ cd Spatiotemporal-Lightning-Analytics
 # 1. Create the database
 psql -U postgres -c "CREATE DATABASE lightning_db;"
 
-# 2. Apply all migrations (schema + indexes + materialized views)
+# 2. Apply all migrations (schema + indexes + views)
 python -m alembic upgrade head
 
 # 3. Load state boundary shapefile
 shp2pgsql -s 4326 shapefiles/India_State_Boundary.shp india_states_temp | psql -U postgres -d lightning_db
-
-# 4. Generate 1M synthetic rows (~95 seconds)
-python ingestion/synthetic_generator.py
-
-# 5. Run spatial join + refresh materialized views
 psql -U postgres -d lightning_db -c "
-  UPDATE lightning_strikes ls SET state_id = ist.state_id
-  FROM india_states ist WHERE ST_Within(ls.geom, ist.geom);
-  SELECT refresh_lightning_views();
+  INSERT INTO india_states (state_name, state_code, region, geom)
+  SELECT name, type, NULL, ST_Multi(geom)::geometry(MultiPolygon, 4326) FROM india_states_temp;
+  DROP TABLE india_states_temp;
 "
 
-# 6. Ingest real data
+# 4. Ingest data — loads, maps states, refreshes the daily MV, and verifies in one command
 python ingestion/ingest.py --file ingestion/test_data.csv
 ```
 
-**Requirements:** PostgreSQL 17, PostGIS, Python 3.10, psycopg2, Alembic, NumPy
+**Requirements:** PostgreSQL 17, PostGIS, Python 3.10, psycopg2, Alembic
 
 ---
 
 ## Performance Benchmarks
 
-Benchmarked with `EXPLAIN ANALYZE` on 1,000,000 rows.  
-**Environment:** Windows 10, PostgreSQL 17, local disk, warm cache.  
-**Method:** `SET enable_indexscan=off; SET enable_bitmapscan=off;` to force sequential scans for the BEFORE baseline, then reset to defaults for AFTER.
-
-| Query | Before | After | Improvement |
-|---|---|---|---|
-| Time range aggregation (single year) | 802ms | 167ms | **4.8× faster** |
-| Composite filter (time + state) | 53ms | 69ms | Index scan confirmed |
-| High intensity filter (multi-year) | 255ms | 161ms | **1.6× faster** |
-| Grouped aggregation on MV | 308ms | 184ms | **1.7× faster** |
-
-> Planning time on multi-year query: 16.7ms → 0.67ms **(25× faster)**
-
-Raw `EXPLAIN ANALYZE` output: [`benchmarks/before_optimization.md`](benchmarks/before_optimization.md) · [`benchmarks/after_optimization.md`](benchmarks/after_optimization.md)
+Benchmark methodology, queries, `EXPLAIN (ANALYZE, BUFFERS)` output and results are available in the [`benchmarks/`](benchmarks/) folder. Please refer to it for details.
 
 ---
 
 ## Architecture
 
 ```
-CSV / Synthetic Data
-        │
-        ▼
-  ingest.py / synthetic_generator.py
-  (validate → dedup → batch insert)
-        │
-        ▼
+CSV Data
+   │
+   ▼
+ingest.py
+(validate → batch insert ON CONFLICT DO NOTHING → spatial map → refresh MV → verify)
+   │
+   ▼
 PostgreSQL 17 + PostGIS
 ├── lightning_strikes  [PARTITIONED BY RANGE(timestamp)]
-│   ├── 2021 · 2022 · 2023 · 2024 · 2025 · 2026 · default
+│   ├── 2021 · 2022 · 2023 · 2024 · 2025 · default
+│   └── UNIQUE (event_id, timestamp)
 ├── india_states  [36 state polygons, GiST indexed]
-├── lightning_master_mv          (1,000,000 rows)
-└── lightning_daily_summary_mv     (57,916 rows)
-        │
-        ▼
-  Apache Superset 6.0
-  (scatter map · state filter · time-range filter)
+├── lightning_points_v            (view over base table + states, 0 rows stored)
+└── lightning_daily_summary_mv    (57,916 rows)
+   │
+   ▼
+Apache Superset 6.0
+(scatter map · state filter · time-range filter · trend charts)
 ```
+
+**Why a view instead of a materialized view for the map:** an earlier design used a 1M-row materialized view for point data. It duplicated the base table, went stale after each ingest, and could not be partitioned. The state join is against only 36 rows, so a live view over the partitioned table is cheaper to maintain and is always current. The daily aggregate stays materialized because it collapses 1M rows into about 58k.
 
 ---
 
 ## Key Features
 
 ### Time-Based Partitioning
-`lightning_strikes` is partitioned by `RANGE(timestamp)` across yearly child tables. A query scoped to 2023 scans only `lightning_strikes_2023` (166k rows) instead of all 1M — the largest single performance gain in the project.
+`lightning_strikes` is partitioned by `RANGE(timestamp)` across yearly child tables (2021–2025) plus a default partition. A query scoped to a single year scans only that year's partition instead of the whole table. Partitioning also enables instant retention (drop or detach an old year) and per-partition maintenance as data grows.
 
 ### Indexing Strategy
 
 | Index | Type | Purpose |
 |---|---|---|
-| `idx_lightning_timestamp_state` | Composite B-tree | Time + state queries |
-| `idx_lightning_high_intensity` | Partial B-tree | High-radiance filter only (smaller index) |
-| `idx_lightning_geom` | GiST | Spatial containment / distance |
-| `idx_lightning_flash_type` | B-tree | Flash type filtering (CG / IC / CC) |
-| `idx_states_geom` | GiST | State boundary spatial joins |
+| `uq_strikes_event_ts` | UNIQUE (event_id, timestamp) | Atomic deduplication for `ON CONFLICT DO NOTHING` |
+| `idx_lightning_timestamp_state` | Composite B-tree | Time + state queries (dashboard workhorse) |
+| `idx_lightning_geom` | GiST | Spatial mapping (`ST_Within`) |
+| `idx_states_geom` | GiST | State boundary side of the spatial join |
+| `idx_mv_daily_date_state` | UNIQUE B-tree (MV) | Daily stats table + `REFRESH CONCURRENTLY` support |
+| `idx_mv_daily_date` | B-tree (MV) | 30-day trend chart |
 
-### Materialized Views
-Two MVs pre-compute expensive aggregations and are refreshed concurrently (zero downtime) via a stored function:
+Indexes that no query used (a partial high-intensity index and a `flash_type` index) were dropped after review.
+
+### Views and Materialized Views
 
 ```sql
-SELECT refresh_lightning_views();
--- lightning_master_mv:        1,000,000 rows
--- lightning_daily_summary_mv:    57,916 rows
+-- Live point data for the dashboard map (always fresh, zero storage)
+SELECT * FROM lightning_points_v WHERE timestamp >= '2023-06-01';
+
+-- Pre-aggregated daily x state summaries
+REFRESH MATERIALIZED VIEW lightning_daily_summary_mv;
+-- lightning_daily_summary_mv: 57,916 rows
 ```
 
 ### Spatial Join (PostGIS)
-Two-pass join: exact `ST_Within` containment first, then a 0.05° `ST_DWithin` boundary sweep for edge cases.
+Single-pass exact point-in-polygon mapping:
 
-```
-Pass 1 (ST_Within):   333,357 rows matched
-Pass 2 (ST_DWithin):   11,022 rows matched
-Total:                344,379 / 1,000,000 (34.4%)
+```sql
+UPDATE lightning_strikes ls SET state_id = ist.state_id
+FROM india_states ist
+WHERE ls.state_id IS NULL AND ST_Within(ls.geom, ist.geom);
 ```
 
-Remaining 65.6% fall outside land boundaries (ocean, neighboring countries) — expected for data generated across India's full bounding box rectangle.
+Points outside every state polygon keep `state_id = NULL` and appear as `Ocean/Unknown` in the views.
+
+A degree-based `ST_DWithin` boundary fallback was removed: its tolerance was in degrees (not meters), so it assigned ocean and cross-border points to states.
 
 ### ETL Pipeline
-`ingest.py` runs full validation before any insert:
-- Coordinates within India bounds (lat 6.5–35.5, lon 68.0–97.5)
-- `flash_type` ∈ {CG, IC, CC}, `quality_flag` ∈ {0, 1, 2}, `radiance` ≥ 0
-- Valid ISO timestamp, valid integer `event_id`
-- Deduplication check against existing IDs
-- Rejected rows written to `_rejected.csv` with error reasons
+`ingest.py` runs the full pipeline in one command:
+
+1. **Validate** — coordinates within India bounds (lat 6.5–35.5, lon 68.0–97.5), `flash_type` ∈ {CG, IC, CC}, `quality_flag` ∈ {0, 1, 2}, `radiance` ≥ 0, valid ISO timestamp, valid integer `event_id`
+2. **Load** — 5,000-row batches with `INSERT ... ON CONFLICT (event_id, timestamp) DO NOTHING`; the database enforces uniqueness atomically, with no SELECT round trip per batch
+3. **Spatial map** — assign `state_id` via `ST_Within`
+4. **Refresh** — `REFRESH MATERIALIZED VIEW lightning_daily_summary_mv`
+5. **Verify** — log total / mapped / unmapped counts
+6. **Reject** — invalid rows written to `_rejected.csv` with error reasons
 
 ```bash
 python ingestion/ingest.py --file your_file.csv
-# Inserted: 500 | Dupes: 0 | Rejected: 0 | Time: 2.1s
+# Inserted: 500 | Skipped: 0 | Rejected: 0 | Time: 2.1s
 ```
 
 ### Schema Migrations (Alembic)
+Alembic is the single source of truth for the schema. The `.sql` files in `database/` are reference-only.
+
 ```
 <base> → create_lightning_strikes_partitioned
        → add_indexes
-       → add_materialized_views  (head)
+       → add_materialized_views
+       → add_unique_event_timestamp_constraint
+       → drop_master_mv_create_points_view
+       → prune_unused_indexes  (head)
 ```
 
 ```bash
@@ -182,8 +182,17 @@ lightning_strikes  (PARTITIONED BY RANGE timestamp)
 ├── intensity_category  text        -- GENERATED STORED (Low / Medium / High)
 ├── quality_flag        smallint    -- 0 / 1 / 2
 ├── geom                geometry(Point, 4326)
-└── state_id            FK → india_states
+├── state_id            FK → india_states
+├── created_at          timestamptz
+└── UNIQUE (event_id, timestamp)
 ```
+
+---
+
+## Known Limitations
+
+- **Composite uniqueness:** the same `event_id` with a different timestamp would be treated as a new event.
+- **MV refresh:** `ingest.py` uses a plain `REFRESH`, which briefly blocks reads on the daily summary.
 
 ---
 
@@ -192,24 +201,22 @@ lightning_strikes  (PARTITIONED BY RANGE timestamp)
 ```
 spatiotemporal_dashboard/
 ├── database/
-│ ├── schema.sql
-│ ├── partitions.sql
-│ ├── indexes.sql
-│ ├── materialized_views.sql
+│ ├── schema.sql              (reference only)
+│ ├── partitions.sql          (reference only)
+│ ├── indexes.sql             (reference only)
+│ ├── materialized_views.sql  (reference only)
 │ ├── load_states.sql
 │ └── migrations/
 │ ├── 5566ece10587_create_lightning_strikes_partitioned.py
 │ ├── bdb65b394328_add_indexes.py
-│ └── 48b26036eceb_add_materialized_views.py
+│ ├── 48b26036eceb_add_materialized_views.py
+│ └── (+ unique constraint, points view, index prune migrations)
 ├── ingestion/
-│ ├── synthetic_generator.py
 │ ├── ingest.py
 │ ├── test_data.csv
 │ ├── test_new_data.csv
 │ └── test_bad_data.csv
 ├── benchmarks/
-│ ├── before_optimization.md
-│ └── after_optimization.md
 ├── shapefiles/
 │ ├── India_State_Boundary.shp
 │ ├── India_State_Boundary.shx
@@ -227,5 +234,5 @@ spatiotemporal_dashboard/
 
 **Database:** PostgreSQL 17 · PostGIS  
 **Language:** Python 3.10  
-**Libraries:** psycopg2 · NumPy · Alembic · SQLAlchemy  
+**Libraries:** psycopg2 · Alembic · SQLAlchemy  
 **Visualization:** Apache Superset 6.0
