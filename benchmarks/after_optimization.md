@@ -1,108 +1,87 @@
-# After Optimization — EXPLAIN ANALYZE Results
-Database: nrsc_lightning_db
-Rows: 1,000,000
-Settings: enable_indexscan=on, enable_bitmapscan=on (default)
+# Benchmarks — EXPLAIN (ANALYZE, BUFFERS) Results
+
+Database: `nrsc_lightning_db` (PostgreSQL 17 + PostGIS)
+Rows: ~1,000,000
+Environment: Windows 10, local disk
+
+## Method
+
+- Every query is run with `EXPLAIN (ANALYZE, BUFFERS)`.
+- The baseline is an unpartitioned copy of the table (`lightning_strikes_unpart`) with identical data, so each comparison changes one variable.
+- Warm cache: the second run is reported.
+- Index on/off configurations are compared on the same data so the effect of the index is isolated.
 
 ---
 
-## Query 1 — Time Range Aggregation (Single Year)
+## 1. Partitioning — whole-year aggregation
+
 ```sql
 SELECT COUNT(*), AVG(radiance), MAX(radiance)
 FROM lightning_strikes
 WHERE timestamp BETWEEN '2023-01-01' AND '2023-12-31';
 ```
-**Execution Time: 166.975 ms**
-**Scan Type: Parallel Seq Scan (partition pruning active)**
-**Improvement: 802ms → 167ms (4.8x faster)**
-```
-Finalize Aggregate (actual time=160.542..166.904 rows=1 loops=1)
-  -> Gather (actual time=57.441..166.884 rows=2 loops=1)
-      Workers Planned: 1 | Workers Launched: 1
-      -> Parallel Seq Scan on lightning_strikes_2023
-           Filter: timestamp BETWEEN 2023-01-01 AND 2023-12-31
-           Rows Removed by Filter: 107
-Planning Time: 0.230 ms  (was 7.448ms)
-Execution Time: 166.975 ms  (was 802.469ms)
-```
-**Key win: Planning time dropped from 7.4ms to 0.2ms — partition stats cached**
+
+| Config | Plan | Execution Time | Rows Matched |
+|---|---|---|---|
+| Unpartitioned (`lightning_strikes_unpart`) | Parallel Bitmap Heap Scan | 142.5 ms | 166,553 |
+| Partitioned (`lightning_strikes`) | Parallel Seq Scan on `lightning_strikes_2023` only | 54.8 ms | ~166,915 |
+
+**Result:** 142.5 ms → 54.8 ms (~2.6×). The partitioned plan touches only `lightning_strikes_2023`; the unpartitioned plan reads from the full table.
 
 ---
 
-## Query 2 — Composite Filter (Time + State)
+## 2. Selective day-plus-state query
+
 ```sql
-SELECT COUNT(*), AVG(radiance)
+SELECT COUNT(*)
 FROM lightning_strikes
-WHERE timestamp BETWEEN '2022-01-01' AND '2022-06-30'
-AND state_id IS NOT NULL;
+WHERE timestamp >= '2023-06-15' AND timestamp < '2023-06-16'
+  AND state_id = 8;
 ```
-**Execution Time: 69.929 ms**
-**Scan Type: Index Scan using composite index**
-**Note: state_id all NULL (no shapefile loaded yet) limits index benefit**
-```
-Aggregate (actual time=69.889..69.890 rows=1 loops=1)
-  -> Index Scan using lightning_strikes_2022_timestamp_state_id_idx
-       Index Cond: timestamp BETWEEN 2022-01-01 AND 2022-06-30 AND state_id IS NOT NULL
-Planning Time: 0.301 ms  (was 2.331ms)
-Execution Time: 69.929 ms
-```
-**Key win: Switched from Seq Scan to Index Scan. Full benefit visible after Track B shapefile load.**
+
+| Config | Table | Index | Plan | Execution Time | Rows | Heap Fetches |
+|---|---|---|---|---|---|---|
+| A — neither | unpartitioned | off | Parallel Seq Scan (1M rows) | 97.4 ms | 18 | — |
+| B — index only | unpartitioned | on | Index Only Scan | 0.058 ms | 18 | 0 |
+| C — partition only | partitioned | off | Parallel Seq Scan (2023 partition) | 60.9 ms | 18 | — |
+| D — both | partitioned | on | Index Only Scan on 2023 partition | 0.059 ms | 18 | 0 |
+
+**Result:** 97.4 ms → 0.059 ms (~1,650×) for the combined partitioned + indexed path.
+
+**Attribution**
+
+- Partitioning alone (A → C): 97.4 → 60.9 ms, ~1.6× — one partition scanned instead of the full table.
+- Indexing alone (A → B): 97.4 → 0.058 ms, ~1,680× — the index-only scan eliminated 99.99% of rows.
+- Both (A → D): statistically identical to indexing alone, because at this selectivity the index does nearly all the work and partitioning has nothing left to skip.
+
+The two mechanisms serve different query shapes: partitioning helps broad time-range queries, and the composite `(timestamp, state_id)` index helps selective filters. They are complementary, not additive on the same query.
 
 ---
 
-## Query 3 — High Intensity Filter (Multi-Year)
+## 3. Daily materialized view aggregation
+
 ```sql
-SELECT COUNT(*), AVG(radiance)
-FROM lightning_strikes
-WHERE intensity_category = 'High'
-AND timestamp BETWEEN '2021-01-01' AND '2025-12-31';
+SELECT state_name, SUM(total_strikes), AVG(avg_radiance)
+FROM lightning_daily_summary_mv
+WHERE strike_date BETWEEN '2023-01-01' AND '2023-12-31'
+GROUP BY state_name
+ORDER BY SUM(total_strikes) DESC;
 ```
-**Execution Time: 161.112 ms**
-**Scan Type: Parallel Seq Scan across 5 partitions**
-**Improvement: 255ms → 161ms (1.6x faster)**
-```
-Finalize Aggregate (actual time=150.094..161.062 rows=1 loops=1)
-  -> Gather (actual time=149.790..161.043 rows=3 loops=1)
-      Workers Planned: 2 | Workers Launched: 2
-      -> Parallel Append across 5 partitions
-Planning Time: 0.671 ms  (was 16.713ms)
-Execution Time: 161.112 ms  (was 255.890ms)
-```
-**Key win: Planning time dropped 25x — from 16.7ms to 0.67ms**
+
+Plan: `Index Scan using idx_mv_daily_date` on the 57k-row materialized view — a real plan change (seq scan → index scan) at the aggregate layer.
 
 ---
 
-## Query 4 — Grouped Aggregation on Materialized View
-```sql
-SELECT state_name, COUNT(*), AVG(radiance)
-FROM lightning_master_mv
-WHERE timestamp BETWEEN '2023-01-01' AND '2023-12-31'
-GROUP BY state_name ORDER BY COUNT(*) DESC;
-```
-**Execution Time: 183.617 ms**
-**Scan Type: Parallel Index Scan using idx_mv_master_timestamp**
-**Improvement: 308ms → 184ms (1.7x faster)**
-```
-Sort (actual time=173.863..183.471 rows=1 loops=1)
-  -> Finalize GroupAggregate (actual time=173.856..183.463)
-      -> Gather Merge (actual time=173.841..183.448)
-          -> Partial HashAggregate
-              -> Parallel Index Scan using idx_mv_master_timestamp
-                   Index Cond: timestamp BETWEEN 2023-01-01 AND 2023-12-31
-Planning Time: 0.166 ms  (was 0.498ms)
-Execution Time: 183.617 ms  (was 308.124ms)
-```
-**Key win: Switched from Seq Scan to Index Scan on materialized view**
+## Summary
+
+| Query | Baseline | Optimized | Mechanism |
+|---|---|---|---|
+| Whole-year aggregation | 142.5 ms (unpartitioned, indexed) | 54.8 ms (partitioned, indexed) | Partition pruning |
+| Selective day + state | 97.4 ms (unpartitioned, no index) | 0.059 ms (partitioned, indexed) | Index-only scan on one partition |
+| Daily MV aggregation | — | — | MV index scan |
 
 ---
 
-## Summary Table
+## Note on the original benchmark
 
-| Query | Before | After | Improvement |
-|-------|--------|-------|-------------|
-| Time range aggregation | 802ms | 167ms | 4.8x faster |
-| Composite filter | 53ms | 69ms | index scan confirmed, full benefit post Track B |
-| High intensity multi-year | 255ms | 161ms | 1.6x faster |
-| MV grouped aggregation | 308ms | 184ms | 1.7x faster |
-
-**Biggest win: Query 1 — 802ms → 167ms via partition pruning alone**
-**Planning time improvement: up to 25x faster (Query 3: 16.7ms → 0.67ms)**
+The first benchmark used a BEFORE/AFTER method (`enable_indexscan = off` vs on, one run each, BEFORE first). Both Q1 plans were `Parallel Seq Scan` on the same partition, so the earlier 802 ms → 167 ms difference was cache warming, not partitioning. It has been replaced by the partitioned-vs-unpartitioned comparison above.
