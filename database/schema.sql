@@ -1,14 +1,9 @@
 -- ============================================================
--- NRSC Lightning Data Platform
--- schema.sql — Core table definitions
+-- REFERENCE ONLY — Authoritative DDL is in database/migrations/
 -- ============================================================
 
--- Enable PostGIS if not already enabled
 CREATE EXTENSION IF NOT EXISTS postgis;
 
--- ============================================================
--- DIMENSION TABLE: india_states
--- ============================================================
 CREATE TABLE india_states (
     state_id        serial PRIMARY KEY,
     state_name      text NOT NULL,
@@ -17,9 +12,6 @@ CREATE TABLE india_states (
     geom            geometry(MultiPolygon, 4326)
 );
 
--- ============================================================
--- FACT TABLE: lightning_strikes (partitioned parent)
--- ============================================================
 CREATE TABLE lightning_strikes (
     event_id            bigint NOT NULL,
     latitude            numeric(9,6) NOT NULL,
@@ -37,5 +29,7 @@ CREATE TABLE lightning_strikes (
     quality_flag        smallint DEFAULT 0 CHECK (quality_flag IN (0, 1, 2)),
     geom                geometry(Point, 4326),
     state_id            integer REFERENCES india_states(state_id),
-    created_at          timestamptz DEFAULT now()
+    created_at          timestamptz DEFAULT now(),
+
+    CONSTRAINT uq_strikes_event_ts UNIQUE (event_id, timestamp)
 ) PARTITION BY RANGE (timestamp);
