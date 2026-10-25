@@ -1,7 +1,7 @@
 # ============================================================
 # NRSC Lightning Data Platform
-# ingest.py — Production-grade CSV ingestion pipeline
-# Usage: python ingestion/ingest.py --file data.csv
+# ingest.py — CSV ingestion pipeline with spatial enrichment
+# Usage: python ingestion/ingest.py --file data.csv [--since YYYY-MM-DD]
 # ============================================================
 
 import psycopg2
@@ -26,7 +26,6 @@ DB_CONFIG = {
 
 BATCH_SIZE = 5000
 
-# India bounding box
 LAT_MIN, LAT_MAX = 6.5,  35.5
 LON_MIN, LON_MAX = 68.0, 97.5
 
@@ -39,7 +38,7 @@ REQUIRED_COLUMNS = {
 }
 
 # ============================================================
-# LOGGING SETUP
+# LOGGING
 # ============================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -100,64 +99,115 @@ def validate_row(row, row_num):
         return None, errors
 
     return {
-        'event_id':    event_id,
-        'latitude':    lat,
-        'longitude':   lon,
-        'timestamp':   ts,
-        'radiance':    radiance,
-        'flash_type':  flash_type,
+        'event_id':     event_id,
+        'latitude':     lat,
+        'longitude':    lon,
+        'timestamp':    ts,
+        'radiance':     radiance,
+        'flash_type':   flash_type,
         'quality_flag': int(quality_flag),
-        'geom':        f"SRID=4326;POINT({lon} {lat})"
+        'geom':         f"SRID=4326;POINT({lon} {lat})"
     }, []
 
 # ============================================================
-# DEDUPLICATION — fetch existing event_ids in bulk
+# BATCH INSERT — ON CONFLICT DO NOTHING
 # ============================================================
-def get_existing_ids(cur, event_ids):
-    if not event_ids:
-        return set()
-    cur.execute(
-        "SELECT event_id FROM lightning_strikes WHERE event_id = ANY(%s)",
-        (list(event_ids),)
+def insert_batch(cur, conn, batch):
+    batch = list({(r['event_id'], r['timestamp']): r for r in batch}.values())
+
+    execute_values(
+        cur,
+        """
+        INSERT INTO lightning_strikes
+            (event_id, latitude, longitude, timestamp,
+             radiance, flash_type, quality_flag, geom, state_id)
+        VALUES %s
+        ON CONFLICT (event_id, timestamp) DO NOTHING
+        """,
+        batch,
+        template="""(
+            %(event_id)s, %(latitude)s, %(longitude)s, %(timestamp)s,
+            %(radiance)s, %(flash_type)s, %(quality_flag)s,
+            ST_GeomFromEWKT(%(geom)s), NULL
+        )""",
+        page_size=len(batch)
     )
-    return {row[0] for row in cur.fetchall()}
+
+    inserted = cur.rowcount
+    skipped  = len(batch) - inserted
+    conn.commit()
+    return inserted, skipped
 
 # ============================================================
-# MAIN PIPELINE
+# POST-LOAD: spatial map, MV refresh, verify
+# ============================================================
+def spatial_map(cur, conn):
+    log.info("Running spatial mapping...")
+    cur.execute("""
+        UPDATE lightning_strikes ls
+        SET state_id = ist.state_id
+        FROM india_states ist
+        WHERE ls.state_id IS NULL
+          AND ST_Within(ls.geom, ist.geom);
+    """)
+    mapped = cur.rowcount
+    conn.commit()
+    log.info(f"Spatial mapping: {mapped:,} rows assigned to states")
+    return mapped
+
+def refresh_views(cur, conn):
+    log.info("Refreshing daily summary MV...")
+    cur.execute("REFRESH MATERIALIZED VIEW lightning_daily_summary_mv;")
+    conn.commit()
+    log.info("MV refreshed")
+
+def verify(cur):
+    cur.execute("""
+        SELECT COUNT(*),
+               COUNT(*) FILTER (WHERE state_id IS NOT NULL),
+               COUNT(*) FILTER (WHERE state_id IS NULL)
+        FROM lightning_strikes;
+    """)
+    total, mapped, unmapped = cur.fetchone()
+    pct = (mapped / total * 100) if total else 0
+    log.info(f"Verify: {total:,} total, {mapped:,} mapped ({pct:.1f}%), "
+             f"{unmapped:,} unmapped")
+    return total, mapped, unmapped
+
+# ============================================================
+# MAIN
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description='NRSC Lightning Data Ingestion Pipeline')
-    parser.add_argument('--file', required=True, help='Path to input CSV file')
+    parser = argparse.ArgumentParser(description='NRSC Lightning Data Ingestion')
+    parser.add_argument('--file', required=True, help='Path to input CSV')
+    parser.add_argument('--since', help='Only ingest rows with timestamp >= YYYY-MM-DD')
     args = parser.parse_args()
 
     if not os.path.exists(args.file):
         log.error(f"File not found: {args.file}")
         return
 
+    since_ts = None
+    if args.since:
+        since_ts = datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+        log.info(f"Incremental mode: only rows with timestamp >= {since_ts.isoformat()}")
+
     log.info(f"Starting ingestion: {args.file}")
 
-    # Rejected rows output file
     rejected_file = args.file.replace('.csv', '_rejected.csv')
 
     conn = psycopg2.connect(**DB_CONFIG)
     cur  = conn.cursor()
 
-    stats = {
-        'total':      0,
-        'inserted':   0,
-        'duplicates': 0,
-        'rejected':   0
-    }
+    stats = {'total': 0, 'inserted': 0, 'skipped': 0, 'rejected': 0, 'filtered': 0}
 
     start_time    = time.time()
     batch_valid   = []
-    batch_raw     = []
     rejected_rows = []
 
     with open(args.file, newline='', encoding='utf-8') as csvfile:
         reader = csv.DictReader(csvfile)
 
-        # Check required columns exist
         missing = REQUIRED_COLUMNS - set(reader.fieldnames or [])
         if missing:
             log.error(f"CSV missing required columns: {missing}")
@@ -174,34 +224,43 @@ def main():
                 rejected_rows.append(row)
                 continue
 
-            batch_valid.append(validated)
-            batch_raw.append(row)
+            # Incremental filter
+            if since_ts and validated['timestamp'] < since_ts:
+                stats['filtered'] += 1
+                continue
 
-            # Process batch
+            batch_valid.append(validated)
+
             if len(batch_valid) >= BATCH_SIZE:
-                inserted, dupes = insert_batch(cur, conn, batch_valid)
-                stats['inserted']   += inserted
-                stats['duplicates'] += dupes
+                inserted, skipped = insert_batch(cur, conn, batch_valid)
+                stats['inserted'] += inserted
+                stats['skipped']  += skipped
                 log.info(f"Row {row_num}: {stats['inserted']:,} inserted, "
-                         f"{stats['duplicates']:,} dupes, "
+                         f"{stats['skipped']:,} skipped, "
                          f"{stats['rejected']:,} rejected")
                 batch_valid = []
-                batch_raw   = []
 
-        # Final batch
         if batch_valid:
-            inserted, dupes = insert_batch(cur, conn, batch_valid)
-            stats['inserted']   += inserted
-            stats['duplicates'] += dupes
+            inserted, skipped = insert_batch(cur, conn, batch_valid)
+            stats['inserted'] += inserted
+            stats['skipped']  += skipped
 
-    # Write rejected rows to CSV
     if rejected_rows:
         with open(rejected_file, 'w', newline='', encoding='utf-8') as rf:
-            fieldnames = list(rejected_rows[0].keys())
-            writer = csv.DictWriter(rf, fieldnames=fieldnames)
+            writer = csv.DictWriter(rf, fieldnames=list(rejected_rows[0].keys()))
             writer.writeheader()
             writer.writerows(rejected_rows)
         log.info(f"Rejected rows written to: {rejected_file}")
+
+    # Post-load
+    spatial_map(cur, conn)
+    refresh_views(cur, conn)
+    verify(cur)
+
+    # Fresh planner statistics
+    log.info("Running ANALYZE...")
+    cur.execute("ANALYZE lightning_strikes;")
+    conn.commit()
 
     cur.close()
     conn.close()
@@ -211,36 +270,11 @@ def main():
     log.info(f"Ingestion complete in {elapsed:.1f}s")
     log.info(f"Total rows processed : {stats['total']:,}")
     log.info(f"Inserted             : {stats['inserted']:,}")
-    log.info(f"Duplicates skipped   : {stats['duplicates']:,}")
+    log.info(f"Skipped (duplicates) : {stats['skipped']:,}")
     log.info(f"Rejected (invalid)   : {stats['rejected']:,}")
+    log.info(f"Filtered (--since)   : {stats['filtered']:,}")
     log.info("=" * 50)
 
-def insert_batch(cur, conn, batch):
-    event_ids = {r['event_id'] for r in batch}
-    existing  = get_existing_ids(cur, event_ids)
-
-    clean = [r for r in batch if r['event_id'] not in existing]
-    dupes = len(batch) - len(clean)
-
-    if clean:
-        execute_values(
-            cur,
-            """
-            INSERT INTO lightning_strikes
-                (event_id, latitude, longitude, timestamp,
-                 radiance, flash_type, quality_flag, geom, state_id)
-            VALUES %s
-            """,
-            clean,
-            template="""(
-                %(event_id)s, %(latitude)s, %(longitude)s, %(timestamp)s,
-                %(radiance)s, %(flash_type)s, %(quality_flag)s,
-                ST_GeomFromEWKT(%(geom)s), NULL
-            )"""
-        )
-        conn.commit()
-
-    return len(clean), dupes
 
 if __name__ == "__main__":
     main()
