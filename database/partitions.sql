@@ -1,6 +1,5 @@
 -- ============================================================
--- NRSC Lightning Data Platform
--- partitions.sql — Yearly partition definitions
+-- REFERENCE ONLY — Authoritative DDL is in database/migrations/
 -- ============================================================
 
 CREATE TABLE lightning_strikes_2021
@@ -27,7 +26,6 @@ CREATE TABLE lightning_strikes_2026
     PARTITION OF lightning_strikes
     FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 
--- Catch-all for anything outside defined ranges
 CREATE TABLE lightning_strikes_default
     PARTITION OF lightning_strikes
     DEFAULT;
