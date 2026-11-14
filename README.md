@@ -21,15 +21,13 @@ The engineering is in the database, the pipeline, and the benchmarks. Apache Sup
 
 ## Highlights
 
-- 🧱 Range partitioning by year (2021–2026) plus a default partition, with automatic partition routing
+- 🧱 Range partitioning by year (2021–2025) plus a default partition, with automatic partition routing
 - 🗺️ PostGIS exact point-in-polygon (`ST_Within`) spatial join mapping strikes to 36 state boundaries
 - 👁️ Dashboard map reads a live view over the partitioned base table: zero storage, always fresh, no refresh needed
 - ⚙️ Daily materialized view pre-aggregating strikes into **57,916** daily-state summaries
 - 🔒 Database-enforced deduplication via `UNIQUE (event_id, timestamp)`: atomic and race-free
 - 🐍 Python ETL pipeline: validate → batch insert with `ON CONFLICT DO NOTHING` → spatial mapping → MV refresh → verify → `ANALYZE`, in one command
 - ⏱️ Measured with `EXPLAIN (ANALYZE, BUFFERS)`: a selective day-plus-state query drops from **97.4 ms to 0.06 ms**, and whole-year aggregation runs **~2.6× faster** through partition pruning
-- 🔁 Alembic as the single source of truth for schema, with upgrade/downgrade paths
-- 🧪 Six pytest tests covering validation, dedup idempotency, and partition pruning
 - 📊 Apache Superset dashboard with state + time-range filters on a live map
 
 ---
@@ -41,15 +39,11 @@ git clone https://github.com/Varuncc891/Spatiotemporal-Lightning-Analytics
 cd Spatiotemporal-Lightning-Analytics
 
 # 0. Set your database credentials in DB_CONFIG (ingestion/ingest.py)
-#    and the database URL used by Alembic
 
 # 1. Create the database
 psql -U postgres -c "CREATE DATABASE lightning_db;"
 
-# 2. Apply all migrations (schema + indexes + views)
-python -m alembic upgrade head
-
-# 3. Load state boundary shapefile
+# 2. Load state boundary shapefile
 shp2pgsql -s 4326 shapefiles/India_State_Boundary.shp india_states_temp | psql -U postgres -d lightning_db
 psql -U postgres -d lightning_db -c "
   INSERT INTO india_states (state_name, state_code, region, geom)
@@ -57,14 +51,14 @@ psql -U postgres -d lightning_db -c "
   DROP TABLE india_states_temp;
 "
 
-# 4. Ingest data: loads, maps states, refreshes the daily MV, verifies, and runs ANALYZE in one command
+# 3. Ingest data: loads, maps states, refreshes the daily MV, verifies, and runs ANALYZE in one command
 python ingestion/ingest.py --file ingestion/test_data.csv
 
 # Incremental load: only rows with timestamp >= the given date
 python ingestion/ingest.py --file data.csv --since 2026-01-01
 ```
 
-**Requirements:** PostgreSQL 17, PostGIS (includes `shp2pgsql`), Python 3.10, psycopg2, Alembic, pytest
+**Requirements:** PostgreSQL 17, PostGIS (includes `shp2pgsql`), Python 3.10, psycopg2
 
 ---
 
@@ -124,7 +118,7 @@ ingest.py
    ▼
 PostgreSQL 17 + PostGIS
 ├── lightning_strikes  [PARTITIONED BY RANGE(timestamp)]
-│   ├── 2021 · 2022 · 2023 · 2024 · 2025 · 2026 · default
+│   ├── 2021 · 2022 · 2023 · 2024 · 2025 · default
 │   └── UNIQUE (event_id, timestamp)
 ├── india_states  [36 state polygons, GiST indexed]
 ├── lightning_points_v            (view over base table + states, 0 rows stored)
@@ -142,7 +136,7 @@ Apache Superset 6.0
 ## Key Features
 
 ### Time-Based Partitioning
-`lightning_strikes` is partitioned by `RANGE(timestamp)` across yearly child tables (2021–2026) plus a default partition. A query scoped to a single year scans only that year's partition instead of the whole table. Partitioning also enables instant retention (drop or detach an old year) and per-partition maintenance as data grows.
+`lightning_strikes` is partitioned by `RANGE(timestamp)` across yearly child tables (2021–2025) plus a default partition. A query scoped to a single year scans only that year's partition instead of the whole table. Partitioning also enables instant retention (drop or detach an old year) and per-partition maintenance as data grows.
 
 ### Indexing Strategy
 Every index is tied to a specific query pattern.
@@ -217,25 +211,6 @@ A degree-based `ST_DWithin` boundary fallback was removed: its tolerance was in 
 
 **Incremental loads:** `--since YYYY-MM-DD` filters CSV rows to `timestamp >= since` before batching, enabling daily loads without reprocessing the whole file.
 
-### Schema Migrations (Alembic)
-Alembic is the single source of truth for the schema. The `.sql` files in `database/` are reference-only. A fresh database builds with one command (`python -m alembic upgrade head`), and the first migration includes `CREATE EXTENSION IF NOT EXISTS postgis`.
-
-```
-<base> → create_lightning_strikes_partitioned
-       → add_indexes
-       → add_materialized_views
-       → add_unique_event_timestamp_constraint
-       → drop_master_mv_create_points_view
-       → prune_unused_indexes  (head)
-```
-
-```bash
-python -m alembic upgrade head   # apply
-python -m alembic downgrade -1   # rollback
-python -m alembic current        # current revision
-python -m alembic history        # audit trail
-```
-
 ---
 
 ## Schema
@@ -279,7 +254,7 @@ Filters: state, time range, and optionally intensity category. The map uses Cust
 
 ## Operations
 
-These are set up manually and are not part of the Alembic migrations. Both `pg_cron` and `pg_stat_statements` must be installed and listed in `shared_preload_libraries`.
+These are set up manually. Both `pg_cron` and `pg_stat_statements` must be installed and listed in `shared_preload_libraries`.
 
 **Scheduled MV refresh.** `ingest.py` refreshes the daily MV after every load, and `pg_cron` refreshes it nightly as a fallback:
 
@@ -322,32 +297,12 @@ ORDER BY idx_scan DESC;
 
 ---
 
-## Testing
-
-```bash
-pytest
-```
-
-Six tests (about 2 seconds) back the main claims:
-
-| Test | Verifies |
-|------|----------|
-| `test_valid_row_passes` | A valid row is accepted |
-| `test_latitude_out_of_bounds_rejected` | Validation rejects a bad latitude |
-| `test_invalid_flash_type_rejected` | Validation rejects a bad enum value |
-| `test_invalid_timestamp_rejected` | Validation rejects a bad timestamp |
-| `test_duplicate_csv_inserts_zero_rows` | `ON CONFLICT` idempotency: the same CSV twice inserts 0 rows |
-| `test_partition_pruning_scans_one_partition` | `EXPLAIN` on a whole-year query shows only the 2023 partition |
-
----
-
 ## Known Limitations
 
 - **Synthetic data:** about 65% of strikes have a `NULL` `state_id` because points were sampled from the India bounding rectangle, which includes ocean and neighboring countries. The pipeline handles this correctly (`Ocean/Unknown` in the views). A production-grade generator would use rejection sampling via `ST_Contains` plus a modeled offshore fraction.
 - **Composite uniqueness:** partitioned tables need the partition key in unique constraints, so the same `event_id` with a different timestamp is treated as a new event.
 - **MV refresh:** `ingest.py` uses a plain `REFRESH`, which briefly blocks reads on the daily summary. The nightly `pg_cron` job uses `CONCURRENTLY`.
 - **Single-node PostgreSQL:** no read replica and no HA/failover. This is adequate for 1M rows.
-- **No CI pipeline yet:** tests run locally with `pytest`.
 - **1M-row scale:** partitioning and indexing effects are measurable at this size, but the trade-offs shift at 10M+ rows (BRIN indexes, columnar aggregation, incremental MV maintenance).
 - **Superset Custom SQL:** the map dataset uses Custom SQL to bypass the forced-metric requirement. It works, but a proper dataset configuration would be cleaner.
 
@@ -356,7 +311,6 @@ Six tests (about 2 seconds) back the main claims:
 ## Roadmap
 
 - Rejection-sample the synthetic data via `ST_Contains` (all points on land, plus a modeled offshore share)
-- GitHub Actions running `alembic upgrade head` and `pytest` on every push
 - Read replica and failover story for the dashboard read path
 - Benchmark at 10M rows to validate the scaling assumptions
 - Incremental MV refresh instead of a full refresh
@@ -373,18 +327,12 @@ Spatiotemporal-Lightning-Analytics/
 │   ├── partitions.sql          (reference only)
 │   ├── indexes.sql             (reference only)
 │   ├── materialized_views.sql  (reference only)
-│   ├── load_states.sql
-│   └── migrations/
-│       ├── 5566ece10587_create_lightning_strikes_partitioned.py
-│       ├── bdb65b394328_add_indexes.py
-│       ├── 48b26036eceb_add_materialized_views.py
-│       └── (+ unique constraint, points view, index prune migrations)
+│   └── load_states.sql
 ├── ingestion/
 │   ├── ingest.py
 │   ├── test_data.csv
 │   ├── test_new_data.csv
 │   └── test_bad_data.csv
-├── tests/                      (6 pytest tests)
 ├── benchmarks/
 ├── shapefiles/
 │   ├── India_State_Boundary.shp
@@ -393,7 +341,6 @@ Spatiotemporal-Lightning-Analytics/
 │   └── India_State_Boundary.prj
 ├── docs/
 │   └── dashboard_1.png
-├── alembic.ini
 └── README.md
 ```
 
@@ -403,5 +350,5 @@ Spatiotemporal-Lightning-Analytics/
 
 **Database:** PostgreSQL 17 · PostGIS · pg_cron · pg_stat_statements  
 **Language:** Python 3.10  
-**Libraries:** psycopg2 · Alembic · SQLAlchemy · pytest  
+**Libraries:** psycopg2 · SQLAlchemy  
 **Visualization:** Apache Superset 6.0
