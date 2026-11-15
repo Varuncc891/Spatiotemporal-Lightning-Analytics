@@ -17,11 +17,11 @@ from datetime import datetime, timezone
 # CONFIG
 # ============================================================
 DB_CONFIG = {
-    "host":     "localhost",
-    "port":     5432,
-    "dbname":   "nrsc_lightning_db",
-    "user":     "postgres",
-    "password": "postgres123"
+    "host":     os.environ.get("DB_HOST", "localhost"),
+    "port":     int(os.environ.get("DB_PORT", "5432")),
+    "dbname":   os.environ.get("DB_NAME", "nrsc_lightning_db"),
+    "user":     os.environ.get("DB_USER", "postgres"),
+    "password": os.environ.get("DB_PASSWORD"),
 }
 
 BATCH_SIZE = 5000
