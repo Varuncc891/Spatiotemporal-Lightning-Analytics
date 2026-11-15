@@ -1,4 +1,7 @@
-# Before Optimization — EXPLAIN ANALYZE Results
+# Initial Baseline — EXPLAIN ANALYZE Results (Superseded)
+
+> **Superseded.** This is the first baseline, kept for reference. Its Query 1 timing (802 ms) was a first-run, cold-cache measurement compared against warmed runs, so it is not a valid partitioning comparison. The valid comparison is in the Benchmarks results file in this folder.
+
 Database: nrsc_lightning_db
 Rows: 1,000,000
 Settings: enable_indexscan=off, enable_bitmapscan=off
@@ -11,9 +14,8 @@ SELECT COUNT(*), AVG(radiance), MAX(radiance)
 FROM lightning_strikes
 WHERE timestamp BETWEEN '2023-01-01' AND '2023-12-31';
 ```
-**Execution Time: 802.469 ms**
+**Execution Time: 802.469 ms (first run, cold cache)**
 **Scan Type: Parallel Seq Scan on lightning_strikes_2023**
-**Rows Scanned: 166,607**
 ```
 Finalize Aggregate (cost=5986.42..5986.43 rows=1 width=72) (actual time=795.615..801.794 rows=1 loops=1)
   -> Gather (cost=5986.30..5986.41) (actual time=137.007..801.740 rows=2 loops=1)
@@ -71,28 +73,4 @@ Finalize Aggregate (actual time=244.001..255.773 rows=1 loops=1)
           -> Parallel Seq Scan on lightning_strikes_2024 (Rows Removed: 80448)
 Planning Time: 16.713 ms
 Execution Time: 255.890 ms
-```
-
----
-
-## Query 4 — Grouped Aggregation on Materialized View
-```sql
-SELECT state_name, COUNT(*), AVG(radiance)
-FROM lightning_master_mv
-WHERE timestamp BETWEEN '2023-01-01' AND '2023-12-31'
-GROUP BY state_name ORDER BY COUNT(*) DESC;
-```
-**Execution Time: 308.124 ms**
-**Scan Type: Parallel Seq Scan on lightning_master_mv**
-**Rows Scanned: ~166,701 | Rows Removed by Filter: 277,766**
-```
-Sort (actual time=300.431..307.186 rows=1 loops=1)
-  -> Finalize GroupAggregate (actual time=300.425..307.179)
-      -> Gather Merge (actual time=300.406..307.160)
-          -> Partial HashAggregate (actual time=262.797..262.805)
-              -> Parallel Seq Scan on lightning_master_mv
-                   Filter: timestamp BETWEEN 2023-01-01 AND 2023-12-31
-                   Rows Removed by Filter: 277766
-Planning Time: 0.498 ms
-Execution Time: 308.124 ms
 ```
