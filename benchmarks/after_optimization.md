@@ -23,10 +23,10 @@ WHERE timestamp BETWEEN '2023-01-01' AND '2023-12-31';
 
 | Config | Plan | Execution Time | Rows Matched |
 |---|---|---|---|
-| Unpartitioned (`lightning_strikes_unpart`) | Parallel Bitmap Heap Scan | 142.5 ms | 166,553 |
-| Partitioned (`lightning_strikes`) | Parallel Seq Scan on `lightning_strikes_2023` only | 54.8 ms | ~166,915 |
+| Unpartitioned (`lightning_strikes_unpart`) | Parallel Bitmap Heap Scan (index-driven) | 142.5 ms | 166,553 |
+| Partitioned (`lightning_strikes`) | Parallel Seq Scan on `lightning_strikes_2023` only | 54.8 ms | 166,553 |
 
-**Result:** 142.5 ms → 54.8 ms (~2.6×). The partitioned plan touches only `lightning_strikes_2023`; the unpartitioned plan reads from the full table.
+**Result:** 142.5 ms → 54.8 ms (~2.6×). The partitioned plan touches only `lightning_strikes_2023`; the unpartitioned plan works against the full 1M-row table.
 
 ---
 
@@ -52,7 +52,7 @@ WHERE timestamp >= '2023-06-15' AND timestamp < '2023-06-16'
 
 - Partitioning alone (A → C): 97.4 → 60.9 ms, ~1.6× — one partition scanned instead of the full table.
 - Indexing alone (A → B): 97.4 → 0.058 ms, ~1,680× — the index-only scan eliminated 99.99% of rows.
-- Both (A → D): statistically identical to indexing alone, because at this selectivity the index does nearly all the work and partitioning has nothing left to skip.
+- Both (A → D): effectively identical to indexing alone, because at this selectivity the index does nearly all the work and partitioning has nothing left to skip.
 
 The two mechanisms serve different query shapes: partitioning helps broad time-range queries, and the composite `(timestamp, state_id)` index helps selective filters. They are complementary, not additive on the same query.
 
@@ -84,4 +84,4 @@ Plan: `Index Scan using idx_mv_daily_date` on the 57k-row materialized view — 
 
 ## Note on the original benchmark
 
-The first benchmark used a BEFORE/AFTER method (`enable_indexscan = off` vs on, one run each, BEFORE first). Both Q1 plans were `Parallel Seq Scan` on the same partition, so the earlier 802 ms → 167 ms difference was cache warming, not partitioning. It has been replaced by the partitioned-vs-unpartitioned comparison above.
+The first benchmark used a BEFORE/AFTER method (`enable_indexscan = off` vs on, one run each, BEFORE first). Both Q1 plans were `Parallel Seq Scan` on the same partition, so the earlier 802 ms → 167 ms difference was cache warming, not partitioning. It has been replaced by the partitioned-vs-unpartitioned comparison above. The original plans are kept in the initial baseline file in this folder for reference.
